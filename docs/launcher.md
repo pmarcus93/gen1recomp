@@ -239,27 +239,68 @@ scrolls as one page whenever it is taller than the room below the tab bar:
   bar cannot be clicked through it. Tab chips carry `pinned = true` and are
   exempt. `pageScroll` resets on a tab change, each tab being a different
   length.
-- A press on empty background pans the page, resolved in `_updateSlotDrag` like
-  every other drag here.
+- A press on empty background pans the page, armed and resolved by the same
+  `pointermoved` / `pointerreleased` pair every other drag here goes through (see
+  Drag and click below).
 
-### Dragging on Android
+### Drag and click
 
-The launcher is handed no move events on any platform: `main.lua` forwards
-neither `touchmoved` nor `mousemoved` while it is up, which is why every drag
-here is resolved by polling inside `draw` instead. Desktop polls the mouse;
-Android used to poll nothing at all ("no reliable pointer polling" meant its
-mouse emulation), so it had no scroll gesture whatsoever -- fine while every
-scroll region was an inner list with a wheel alternative, useless the moment
-the page itself became the thing that scrolls, since a phone is exactly where
-it overflows.
+A press only ARMS a target -- a slot row, a mod toggle, or the page itself -- and
+records **which pointer** armed it. `pointermoved` turns that into a scroll once
+that pointer passes a 4px threshold; `pointerreleased` commits the click when it
+never did. Touch and mouse take the same path, so a swipe that starts on a card
+scrolls instead of selecting the row under the finger, on every platform.
 
-`love.touch` is pollable, so `_pointerHold` reads the first active touch there
-and hands `_updateSlotDrag` the same (held, y) pair the mouse gives on desktop.
-Consequences:
+`main.lua` forwards `mousemoved`/`mousereleased` and `touchmoved`/`touchreleased`
+to the launcher for this, and `wheelmoved` too, passing along who did it: SDL's
+touch id for a finger, `"mouse"` for the mouse, `"pad"` for the gamepad's virtual
+cursor (whose click arms on A and is resolved by `gamepadreleased`).
 
-- Slot rows and mod toggles ARM on press and commit on release on Android too,
-  matching desktop, so a swipe that starts on a card scrolls instead of
-  selecting the row it started on.
-- `touchPollable` (set once in `new`) gates all of it. Where `love.touch` is
-  missing, every Android path is exactly what it was: act on press, never arm,
-  no drag.
+**A drag belongs to the pointer that armed it, and every other pointer is ignored
+for its duration.** A second finger elsewhere on the screen therefore cannot
+commit someone else's click by lifting, cannot cancel it by moving, and cannot
+scroll a list it did not grab.
+
+`main.lua` used to forward none of these events: the launcher sampled
+`love.mouse.isDown` once per frame from inside `draw`, or on Android the first
+entry of `love.touch.getTouches()`, and chained its own handler onto the global
+`love.wheelmoved` from inside `RomImporter.new`. Reading only the first touch kept
+it on one finger by accident rather than by rule, it could not see a release
+outside the window at all, and Android could not be sampled reliably enough to
+have a drag gesture (`touchPollable`, now gone). Events removed the sampling, the
+monkey-patch and about ninety lines with them.
+
+The mouse move and release SDL synthesizes from a touch are dropped on `istouch`,
+exactly as the press is -- see below -- so a phone drives all of this through its
+touch events alone and never applies a drag twice.
+
+### One tap, one press
+
+SDL synthesizes a mouse press out of every touch, so a single launcher tap
+arrived twice: once through `love.touchpressed` and once through
+`love.mousepressed`, both of which `main.lua` forwards to the same method. Every
+control here acts on the press, so one tap on "+ New save slot" created two
+slots, and a mod toggle flipped and flipped straight back -- which is why
+toggling one looked like it did nothing at all. Measured on a device: one tap on
+"Import mod .zip" opened two system file pickers.
+
+LÖVE already labels the synthesized press. `love.mousepressed`'s fourth argument
+is `istouch`, which liblove fills in as `e.button.which == SDL_TOUCH_MOUSEID`
+(`modules/event/sdl/Event.cpp`) -- SDL's own device id for the virtual mouse it
+drives from the touchscreen, not an inference. `main.lua` passes it through and
+`RomImporter:mousepressed` drops any press carrying it, `touchpressed` having
+already delivered that tap. Why the flag rather than something derived:
+
+- **Arrival order cannot be relied on.** SDL queues the synthesized mouse press
+  *before* the finger event, so a guard that waited to see the touch and then
+  suppressed the follow-up never fired -- it was tried, and one tap still opened
+  two pickers.
+- **Positions cannot be compared.** The synthesized press need not carry the
+  touch's exact coordinates (the Android window is `highdpi`).
+- **A real mouse stays live** on tablets, DeX and ChromeOS, being unflagged, and
+  iOS is covered without naming a platform. Desktop needs no exemption: the flag
+  never arrives there.
+
+Gameplay is unaffected. `main.lua`'s `Game:touchpressed` line is only reached
+once the launcher is gone, and gameplay only ever sees mouse presses under the
+`POKEPORT_TOUCH` dev opt-in -- which is why it never had this bug.

@@ -490,14 +490,6 @@ function RomImporter.new(onComplete, opts)
     forceImport = opts.forceImport or false,
     onEditSave = opts.onEditSave,
     android = android,
-    -- Android drag: the launcher is handed no move events at all (main.lua
-    -- forwards neither touchmoved nor mousemoved while it is up), and its mouse
-    -- emulation is what "no reliable pointer polling" below refers to.
-    -- love.touch IS pollable, so where it exists a touch drag can be resolved
-    -- inside draw the same way the desktop mouse is.  Where it does not, every
-    -- Android path stays exactly as it was: act on press, never arm.
-    touchPollable = android and love.touch ~= nil
-      and love.touch.getTouches ~= nil and love.touch.getPosition ~= nil,
     tab = "red",          -- active launcher tab: "red"/"blue"/"yellow"/"mods"
     logo = love.graphics.newImage("assets/logo/logo.png"),
     bcg = love.graphics.newImage("assets/logo/bcg.png"),
@@ -569,21 +561,6 @@ function RomImporter.new(onComplete, opts)
   if android and needRom then
     local name, data = findPendingRom(self.ready)
     if name then self:startData(data, name) end
-  end
-
-  -- Mouse-wheel scroll for the save-slot / mods lists.  main.lua (off limits)
-  -- swallows love.wheelmoved while the launcher is up and never forwards it
-  -- here, so the interactive launcher chains the global handler once,
-  -- non-destructively: our scroll runs first, then the previous handler (which
-  -- no-ops while the Importer is live and resumes feeding the game after
-  -- handoff).  Only the interactive launcher installs this; the scripted /
-  -- import-only paths (launcher = false) leave the handler untouched.
-  if self.launcher and love and love.wheelmoved then
-    local prevWheel = love.wheelmoved
-    love.wheelmoved = function(dx, dy)
-      if not self._handedOff then pcall(self.wheelmoved, self, dx, dy) end
-      if prevWheel then return prevWheel(dx, dy) end
-    end
   end
 
   -- Self-updater: the interactive launcher on a real fused build kicks off one
@@ -770,7 +747,6 @@ function RomImporter:startData(data, displayName)
       -- Stay on the launcher; the player presses Play to boot the new game.
       return
     end
-    self._handedOff = true
     resetPointerCursor(self)
     if self.onComplete then self.onComplete(version) end
   end)
@@ -1085,8 +1061,12 @@ function RomImporter:_cycleTab(delta)
   end
   idx = ((idx - 1 + delta) % #order) + 1
   self.tab = order[idx]
+  -- Drop every half-started press, as the tab chip click does: a pan armed on
+  -- the tab we just left has nothing on screen left to resolve against, and its
+  -- scroll0 belongs to a column of a different length.
   self._slotPress = nil
   self._modPress = nil
+  self._pagePress = nil
 end
 
 function RomImporter:_updatePadCursor(dt)
@@ -1151,8 +1131,11 @@ end
 function RomImporter:gamepadpressed(_, button)
   self:_activatePadCursor()
   if button == "a" then
-    -- Instant click at the virtual pointer (same path as a mouse/touch tap).
-    self:mousepressed(self._padCursor.x, self._padCursor.y, 1)
+    -- A click at the virtual pointer, through the same arm-and-resolve path a
+    -- mouse or finger takes; "pad" is its pointer identity, and gamepadreleased
+    -- below resolves it.  Nothing moves it while A is held, so it always lands
+    -- as a click rather than a drag.
+    self:mousepressed(self._padCursor.x, self._padCursor.y, 1, nil, "pad")
   elseif button == "leftshoulder" then
     self:_cycleTab(-1)
   elseif button == "rightshoulder" then
@@ -1171,7 +1154,11 @@ function RomImporter:gamepadpressed(_, button)
 end
 
 function RomImporter:gamepadreleased(_, button)
-  if button == "dpup" or button == "dpdown"
+  if button == "a" then
+    -- Resolve the press A armed.  Without this the click would never commit:
+    -- a slot row arms on press and waits for its pointer's release.
+    self:pointerreleased(self._padCursor.x, self._padCursor.y, 1, nil, "pad")
+  elseif button == "dpup" or button == "dpdown"
       or button == "dpleft" or button == "dpright" then
     self._padDir[button] = nil
   end
@@ -1188,7 +1175,6 @@ end
 function RomImporter:play(version)
   if self.workState == "working" then return end
   if not self.ready[version] then return end
-  self._handedOff = true
   resetPointerCursor(self)
   if self.onComplete then self.onComplete(version) end
 end
@@ -1836,10 +1822,6 @@ function RomImporter:draw()
   love.graphics.draw(self.vignetteMesh)
   love.graphics.setColor(1, 1, 1, 1)
 
-  -- drag-to-scroll the save-slot list (polls the pointer; no move/release
-  -- events reach the launcher, so click-vs-drag is resolved here)
-  self:_updateSlotDrag()
-
   -- save-slot rename modal (#205), drawn over everything
   if self._rename then
     col(PAL.bgBot, 0.72)
@@ -1936,11 +1918,24 @@ local function inside(r, x, y)
   return true
 end
 
-function RomImporter:mousepressed(x, y, button)
+function RomImporter:mousepressed(x, y, button, istouch, pointer)
   if self._rename then return end -- the rename modal swallows all clicks
-  -- Whether a press can be ARMED and resolved on release, which needs a
-  -- pollable pointer: always on desktop, on Android only where love.touch is.
-  local armDrag = (not self.android) or self.touchPollable
+  -- One tap used to arrive twice: love.touchpressed fires, SDL synthesizes a
+  -- mouse press out of the same touch, and main.lua forwards both here.  Every
+  -- control acts on the press, so one tap on "+ New save slot" created two
+  -- slots, and a mod toggle flipped and flipped straight back -- which is why
+  -- toggling one looked like it did nothing at all.
+  --
+  -- LÖVE labels the synthesized press: `istouch` is `e.button.which ==
+  -- SDL_TOUCH_MOUSEID` (liblove's modules/event/sdl/Event.cpp), SDL's own device
+  -- id for the virtual mouse it drives from the touchscreen.  Keying on that
+  -- instead of on positions or arrival order matters: SDL queues the mouse press
+  -- BEFORE the finger event, so waiting to see the touch first and then
+  -- suppressing the follow-up does not work (measured on a device: one tap still
+  -- opened two file pickers).  A real click is unflagged, so a mouse or trackpad
+  -- on a tablet, DeX or ChromeOS keeps working, iOS is covered without naming a
+  -- platform, and desktop needs no exemption because the flag never arrives.
+  if istouch then return end
   -- right-click a save-slot row to rename it (#205); desktop only (touch
   -- has no secondary button)
   if button == 2 then
@@ -2012,11 +2007,10 @@ function RomImporter:mousepressed(x, y, button)
   end
   -- SAVE SLOT rows / Edit / Delete.  The two labels are checked first so a tap
   -- on either never also selects the row.  A press only ARMS a row click:
-  -- _updateSlotDrag commits it on release when the pointer did not move (a
-  -- moved pointer scrolls instead).  Android arms too wherever love.touch can
-  -- be polled; without that there is nothing to resolve a release with, so it
-  -- keeps selecting on press.  Edit and Delete fire immediately (small fixed
-  -- targets, no scroll conflict).
+  -- pointerreleased commits it when the pointer never moved, a moved pointer
+  -- scrolls instead.  Touch and mouse behave the same here, both being real
+  -- events now.  Edit and Delete fire immediately (small fixed targets, no
+  -- scroll conflict).
   for _, r in ipairs(self.slotDeleteRects or {}) do
     if inside(r, x, y) then
       self:_deleteSlot(self.panelVersion, r.id)
@@ -2031,13 +2025,9 @@ function RomImporter:mousepressed(x, y, button)
   end
   for _, r in ipairs(self.slotRects or {}) do
     if inside(r, x, y) then
-      if not armDrag then
-        self:_selectSlot(self.panelVersion, r.id)
-      else
-        self._slotPress = { version = self.panelVersion, id = r.id, y0 = y,
-          scroll0 = self.slotScroll[self.panelVersion] or 0,
-          pageScroll0 = self.pageScroll or 0, moved = false }
-      end
+      self._slotPress = { version = self.panelVersion, id = r.id, y0 = y,
+        scroll0 = self.slotScroll[self.panelVersion] or 0,
+        pageScroll0 = self.pageScroll or 0, moved = false, pointer = pointer }
       return
     end
   end
@@ -2046,8 +2036,8 @@ function RomImporter:mousepressed(x, y, button)
   end
   -- Mods panel: the import button dispatches on press (fixed header, no scroll
   -- conflict); Delete fires immediately; a toggle switch, which lives in the
-  -- scrollable list, only ARMS a press so _updateSlotDrag can tell a click from
-  -- a drag-scroll (Android, with no pointer polling, toggles on press).
+  -- scrollable list, only ARMS a press so pointermoved / pointerreleased can
+  -- tell a click from a drag-scroll.
   if inside(self.modImportRect, x, y) then
     self:chooseMod(); return
   end
@@ -2059,19 +2049,15 @@ function RomImporter:mousepressed(x, y, button)
   end
   for _, r in ipairs(self.modRects or {}) do
     if inside(r, x, y) then
-      if not armDrag then
-        self:_toggleMod(r.id)
-      else
-        self._modPress = { id = r.id, y0 = y, scroll0 = self.modScroll or 0,
-          pageScroll0 = self.pageScroll or 0, moved = false }
-      end
+      self._modPress = { id = r.id, y0 = y, scroll0 = self.modScroll or 0,
+        pageScroll0 = self.pageScroll or 0, moved = false, pointer = pointer }
       return
     end
   end
   -- Nothing was hit.  On a scrolling page that is a press on empty background,
   -- which is the natural place to grab and pan from.
-  if armDrag and (self._pageMax or 0) > 0 then
-    self._pagePress = { y0 = y, scroll0 = self.pageScroll or 0 }
+  if (self._pageMax or 0) > 0 then
+    self._pagePress = { y0 = y, scroll0 = self.pageScroll or 0, pointer = pointer }
   end
 end
 
@@ -2587,87 +2573,87 @@ function RomImporter:_newSlot(version)
   self.slotScroll[version] = math.huge
 end
 
--- Poll the pointer once per frame to drive drag-scroll + deferred click on the
--- save-slot list.  main.lua forwards neither move nor release events to the
--- launcher, so a press only ARMS a click (see mousepressed) and this resolves
--- it: a pointer that moved past the threshold scrolls; one that did not, on
--- release, selects.  Desktop only -- Android selects on press instead.
--- Where the pointer is this frame and whether it is held, read by polling
--- because no move event ever reaches the launcher: the mouse on desktop, the
--- first active touch on Android.  A nil y means "nothing to read" -- the
--- release branches below do not need one.
-function RomImporter:_pointerHold()
-  if not self.android then return love.mouse.isDown(1), self._my end
-  if not self.touchPollable then return false, nil end
-  local ok, list = pcall(love.touch.getTouches)
-  if not ok or type(list) ~= "table" or list[1] == nil then return false, nil end
-  local ok2, _, ty = pcall(love.touch.getPosition, list[1])
-  if not ok2 or type(ty) ~= "number" then return false, nil end
-  return true, ty
-end
-
-function RomImporter:_updateSlotDrag()
-  if self.android and not self.touchPollable then return end
-  local down, py = self:_pointerHold()
-  py = py or self._my
+-- Drag, driven by events.  A press ARMS a target (a slot row, a mod toggle, or
+-- the page itself) and records WHICH pointer armed it; a move past the threshold
+-- turns that into a scroll, and a release that never moved commits the click.
+-- main.lua forwards mouse and touch move/release here, and the mouse events SDL
+-- synthesizes from a touch are dropped on `istouch` exactly as in mousepressed,
+-- so a phone drives all of this through its touch events alone.
+--
+-- `pointer` is who is doing it: SDL's touch id for a finger, "mouse" for the
+-- mouse, "pad" for the gamepad's virtual cursor.  A drag belongs to the pointer
+-- that armed it and every other pointer is ignored for its duration, so a second
+-- finger elsewhere on the screen can neither scroll someone else's list nor
+-- commit or cancel their click.
+--
+-- This used to be sampled once per frame from inside draw(), because main.lua
+-- forwarded no move or release events at all: it read love.mouse.isDown, or on
+-- Android the first entry of love.touch.getTouches(), and committed a click when
+-- no pointer was down any more.  That stayed on one finger by accident of always
+-- reading the first, and it could not see a release outside the window at all.
+function RomImporter:pointermoved(x, y, istouch, pointer)
+  if istouch then return end
   local maxPage = self._pageMax or 0
+  local thresh = 4 * (self._s or 1)
 
-  -- A press on empty background pans the page while it overflows.  Nothing is
-  -- armed by it, so there is no release action to resolve.
   local pp = self._pagePress
-  if pp then
-    if down then
-      if maxPage > 0 then
-        self.pageScroll = clamp(pp.scroll0 - (py - pp.y0), 0, maxPage)
-      end
-    else
-      self._pagePress = nil
-    end
+  if pp and pp.pointer == pointer and maxPage > 0 then
+    self.pageScroll = clamp(pp.scroll0 - (y - pp.y0), 0, maxPage)
   end
 
   local p = self._slotPress
-  if p then
-    if down then
-      local d = py - p.y0
-      if math.abs(d) > 4 * (self._s or 1) then p.moved = true end
-      if p.moved then
-        -- Paged, the list has no scroll of its own: the drag pans the page, so
-        -- a swipe that starts on a slot row behaves like one starting beside it.
-        if maxPage > 0 then
-          self.pageScroll = clamp(p.pageScroll0 - d, 0, maxPage)
-        else
-          local maxS = (self._slotMax and self._slotMax[p.version]) or 0
-          self.slotScroll[p.version] = clamp(p.scroll0 - d, 0, maxS)
-        end
+  if p and p.pointer == pointer then
+    local d = y - p.y0
+    if math.abs(d) > thresh then p.moved = true end
+    if p.moved then
+      -- Paged, the list has no scroll of its own: the drag pans the page, so a
+      -- swipe that starts on a slot row behaves like one starting beside it.
+      if maxPage > 0 then
+        self.pageScroll = clamp(p.pageScroll0 - d, 0, maxPage)
+      else
+        local maxS = (self._slotMax and self._slotMax[p.version]) or 0
+        self.slotScroll[p.version] = clamp(p.scroll0 - d, 0, maxS)
       end
-    else
-      if not p.moved then self:_selectSlot(p.version, p.id) end
-      self._slotPress = nil
     end
   end
-  -- The same click-vs-drag resolution for the mods list: a moved pointer scrolls
-  -- the list, a still one toggles the armed mod on release.
+
+  -- The same click-vs-drag resolution for the mods list.
   local mp = self._modPress
-  if mp then
-    if down then
-      local d = py - mp.y0
-      if math.abs(d) > 4 * (self._s or 1) then mp.moved = true end
-      if mp.moved then
-        if maxPage > 0 then
-          self.pageScroll = clamp(mp.pageScroll0 - d, 0, maxPage)
-        else
-          self.modScroll = clamp(mp.scroll0 - d, 0, self._modMax or 0)
-        end
+  if mp and mp.pointer == pointer then
+    local d = y - mp.y0
+    if math.abs(d) > thresh then mp.moved = true end
+    if mp.moved then
+      if maxPage > 0 then
+        self.pageScroll = clamp(mp.pageScroll0 - d, 0, maxPage)
+      else
+        self.modScroll = clamp(mp.scroll0 - d, 0, self._modMax or 0)
       end
-    else
-      if not mp.moved then self:_toggleMod(mp.id) end
-      self._modPress = nil
     end
   end
 end
 
--- Mouse wheel over a game tab scrolls its save-slot list (installed onto the
--- global love.wheelmoved in new(); see the chain there).  Clamped to the last
+function RomImporter:pointerreleased(x, y, button, istouch, pointer)
+  if istouch then return end
+  if button ~= nil and button ~= 1 then return end
+  -- Only the pointer that armed a press may resolve it: another finger lifting
+  -- must not commit, or cancel, a click that is still being held.
+  if self._pagePress and self._pagePress.pointer == pointer then
+    self._pagePress = nil
+  end
+  local p = self._slotPress
+  if p and p.pointer == pointer then
+    if not p.moved then self:_selectSlot(p.version, p.id) end
+    self._slotPress = nil
+  end
+  local mp = self._modPress
+  if mp and mp.pointer == pointer then
+    if not mp.moved then self:_toggleMod(mp.id) end
+    self._modPress = nil
+  end
+end
+
+-- Mouse wheel over a game tab scrolls its save-slot list (main.lua forwards
+-- love.wheelmoved straight here while the launcher is up).  Clamped to the last
 -- content extent draw computed for that version.
 function RomImporter:wheelmoved(_, dy)
   local step = 48 * (self._s or 1)
