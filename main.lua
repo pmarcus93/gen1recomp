@@ -358,19 +358,22 @@ end
 
 function love.touchpressed(id, x, y, dx, dy, pressure)
   if editorMode then return end
-  if Importer then return Importer:mousepressed(x, y, 1) end
+  -- `id` identifies the finger: the launcher records it on the press it arms and
+  -- then ignores every other pointer until that one resolves (see
+  -- RomImporter:pointermoved).
+  if Importer then return Importer:mousepressed(x, y, 1, nil, id) end
   Game:touchpressed(id, x, y)
 end
 
 function love.touchmoved(id, x, y, dx, dy, pressure)
   if editorMode then return end
-  if Importer then return end
+  if Importer then return Importer:pointermoved(x, y, nil, id) end
   Game:touchmoved(id, x, y)
 end
 
 function love.touchreleased(id, x, y, dx, dy, pressure)
   if editorMode then return end
-  if Importer then return end
+  if Importer then return Importer:pointerreleased(x, y, 1, nil, id) end
   Game:touchreleased(id, x, y)
 end
 
@@ -379,12 +382,20 @@ function love.wheelmoved(x, y)
     if EditorApp.wheelmoved then return EditorApp.wheelmoved(x, y) end
     return
   end
-  if Importer then return end
+  -- The launcher scrolls its save-slot / mods lists with the wheel.  It used to
+  -- have to chain onto love.wheelmoved itself, from inside RomImporter.new,
+  -- because this line dropped the event.
+  if Importer then return Importer:wheelmoved(x, y) end
   Game:wheelmoved(x, y)
 end
 
-function love.mousepressed(x, y, button)
-  if Importer then return Importer:mousepressed(x, y, button) end
+function love.mousepressed(x, y, button, istouch)
+  -- istouch marks a press SDL synthesized from a touch (its device is
+  -- SDL_TOUCH_MOUSEID).  love.touchpressed above already delivered that tap to
+  -- the launcher, so it needs the flag to recognise and drop the twin; see
+  -- RomImporter:mousepressed.  Gameplay below is unchanged: it only ever sees
+  -- mouse presses under the POKEPORT_TOUCH dev opt-in.
+  if Importer then return Importer:mousepressed(x, y, button, istouch, "mouse") end
   if editorMode and EditorApp.mousepressed then
     return EditorApp.mousepressed(x, y, button)
   end
@@ -393,8 +404,10 @@ function love.mousepressed(x, y, button)
   end
 end
 
-function love.mousereleased(x, y, button)
-  if Importer then return end
+function love.mousereleased(x, y, button, istouch)
+  -- istouch: the twin SDL synthesizes from a touch, which love.touchreleased
+  -- already delivered (see RomImporter:mousepressed).
+  if Importer then return Importer:pointerreleased(x, y, button, istouch, "mouse") end
   if editorMode and EditorApp.mousereleased then
     return EditorApp.mousereleased(x, y, button)
   end
@@ -403,8 +416,9 @@ function love.mousereleased(x, y, button)
   end
 end
 
-function love.mousemoved(x, y)
-  if editorMode or Importer then return end
+function love.mousemoved(x, y, dx, dy, istouch)
+  if editorMode then return end
+  if Importer then return Importer:pointermoved(x, y, istouch, "mouse") end
   if mouseTouch and Game and love.mouse.isDown(1) then
     Game:touchmoved("mouse", x, y)
   end
