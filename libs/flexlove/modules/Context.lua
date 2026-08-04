@@ -162,16 +162,47 @@ Context.elementHasScrollableOverflow = elementHasScrollableOverflow
 --- offsets through `pointHitsElement` so nested scrolled containers are tested
 --- against their visible position. The original helper is removed once
 --- `flexlove.wheelmoved` is rerouted onto this function in task 04.
+
+-- Immediate mode works from a flat z-index list, so scroll offsets and
+-- ancestor clipping are not threaded by a tree walk. Recover both from the
+-- candidate's parent chain: a scrolled ancestor moves the child's visible
+-- box by its scroll offset, and a point clipped away by an ancestor's
+-- viewport can never hit the child. Without this, a scroll region nested
+-- inside a scrolled page kept answering at its UNSCROLLED layout position,
+-- so wheel/drag over its visible position routed to the outer page instead.
+---@param element Element
+---@param x number Screen X coordinate
+---@param y number Screen Y coordinate
+---@return boolean hits
+local function pointHitsElementInVisiblePosition(element, x, y)
+  local scrollOffsetX, scrollOffsetY = 0, 0
+  local ancestor = element.parent
+  while ancestor do
+    if elementHasScrollableOverflow(ancestor) then
+      -- The ancestor's own bounds live in the coordinate space of the
+      -- offsets accumulated so far (its ancestors scroll it too).
+      if not pointHitsElement(ancestor, x, y, scrollOffsetX, scrollOffsetY) then
+        return false
+      end
+      scrollOffsetX = scrollOffsetX + (ancestor._scrollX or 0)
+      scrollOffsetY = scrollOffsetY + (ancestor._scrollY or 0)
+    end
+    ancestor = ancestor.parent
+  end
+  return pointHitsElement(element, x, y, scrollOffsetX, scrollOffsetY)
+end
+
 ---@param x number Screen X coordinate
 ---@param y number Screen Y coordinate
 ---@return Element|nil The scrollable element, or nil
 function Context.findScrollableAtPosition(x, y)
   if Context.isImmediateMode() then
     -- Immediate mode: iterate the z-index ordered list (reverse order =
-    -- topmost first). pointHitsElement supplies the bounds + display guard.
+    -- topmost first). pointHitsElementInVisiblePosition supplies the bounds
+    -- + display guard at the element's visible (scrolled) position.
     for i = #Context._zIndexOrderedElements, 1, -1 do
       local element = Context._zIndexOrderedElements[i]
-      if pointHitsElement(element, x, y) then
+      if pointHitsElementInVisiblePosition(element, x, y) then
         local overflowX = element.overflowX or element.overflow
         local overflowY = element.overflowY or element.overflow
         if
