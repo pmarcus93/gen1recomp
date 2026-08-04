@@ -2707,7 +2707,45 @@ function Element:_drawChildren(backdropCanvas)
     local hasContentOffset = contentOffsetX ~= 0 or contentOffsetY ~= 0
     local hasOffset = hasScrollOffset or hasContentOffset
 
-    -- Set up clipping: rounded-corners (stencil) > overflow (scissor) > none
+    -- LÖVE's scissor is render-target state: setScissor replaces (never
+    -- intersects), setCanvas resets it, and setScissor() clears instead of
+    -- restoring an ancestor's clip.  Nested scroll regions, and the
+    -- rounded-corner stencil path below (which round-trips setCanvas),
+    -- each destroyed the ancestor clip, so scrolled content painted over
+    -- the rest of the window.  Save the incoming scissor, stack this
+    -- element's clip onto it, and restore it on the way out.
+    local psx, psy, psw, psh = love.graphics.getScissor()
+    local hasPrevScissor = psx ~= nil
+
+    -- Scissor coordinates are render-target pixels, immune to the transform
+    -- stack, while self.x/y are layout coordinates that ancestor scroll
+    -- offsets translate before children draw.  Map the content box through
+    -- the current transform so the clip lands where the children land.
+    local function stackedScissor()
+      local x0, y0 = love.graphics.transformPoint(
+        self.x + self.padding.left, self.y + self.padding.top)
+      local x1, y1 = love.graphics.transformPoint(
+        self.x + self.padding.left + self.width,
+        self.y + self.padding.top + self.height)
+      if not hasPrevScissor then
+        return x0, y0, x1 - x0, y1 - y0
+      end
+      local nx = math.max(x0, psx)
+      local ny = math.max(y0, psy)
+      return nx, ny,
+        math.max(0, math.min(x1, psx + psw) - nx),
+        math.max(0, math.min(y1, psy + psh) - ny)
+    end
+    local function restoreScissor()
+      if hasPrevScissor then
+        love.graphics.setScissor(psx, psy, psw, psh)
+      else
+        love.graphics.setScissor()
+      end
+    end
+
+    -- Set up clipping: rounded-corners (stencil) and overflow (scissor)
+    -- stack; either alone clips, both together intersect.
     local clipMode = "none"
     if hasRoundedCorners then
       local roundedBoxWidth = self._borderBoxWidth or (self.width + self.padding.left + self.padding.right)
@@ -2720,8 +2758,15 @@ function Element:_drawChildren(backdropCanvas)
       love.graphics.setCanvas(currentCanvas)
       love.graphics.setStencilTest("greater", 0)
       clipMode = "stencil"
+      -- The setCanvas round-trip cleared any ancestor scissor; put the
+      -- stacked clip back (our own overflow box if we have one).
+      if needsOverflowClipping then
+        love.graphics.setScissor(stackedScissor())
+      elseif hasPrevScissor then
+        love.graphics.setScissor(psx, psy, psw, psh)
+      end
     elseif needsOverflowClipping then
-      love.graphics.setScissor(self.x + self.padding.left, self.y + self.padding.top, self.width, self.height)
+      love.graphics.setScissor(stackedScissor())
       clipMode = "scissor"
     end
 
@@ -2744,8 +2789,9 @@ function Element:_drawChildren(backdropCanvas)
     -- Restore clipping state
     if clipMode == "stencil" then
       love.graphics.setStencilTest()
-    elseif clipMode == "scissor" then
-      love.graphics.setScissor()
+    end
+    if clipMode ~= "none" then
+      restoreScissor()
     end
   end
 

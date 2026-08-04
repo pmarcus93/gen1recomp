@@ -1862,6 +1862,16 @@ function RomImporter:update(dt)
         pcall(love.window.setMode, tonumber(w2), tonumber(h2),
           { resizable = true })
       end
+      -- POKEPORT_LAUNCHER_WHEEL=x,y,dy parks the mouse at (x,y) and fires
+      -- one wheel step of dy notches through the real routing, so a capture
+      -- exercises scroll hit-testing (nested lists under a scrolled page)
+      -- instead of injected scroll state.
+      local wx, wy, wdy = (os.getenv("POKEPORT_LAUNCHER_WHEEL") or "")
+        :match("^(%d+),(%d+),(-?%d+)$")
+      if wx and love.mouse and love.mouse.setPosition then
+        pcall(love.mouse.setPosition, tonumber(wx), tonumber(wy))
+        self:wheelmoved(0, tonumber(wdy))
+      end
     end
     if self._shotTimer > 1.2 then
       self._shotDone = true

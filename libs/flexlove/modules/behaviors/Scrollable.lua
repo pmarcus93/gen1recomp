@@ -214,9 +214,12 @@ local function onDraw(element, _ctx)
   if not (scrollbarDims.vertical.visible or scrollbarDims.horizontal.visible) then
     return
   end
-  -- Clear any parent scissor clipping before drawing scrollbars so they render
-  -- fully visible (scrollbars must not be clipped by ancestor overflow).
-  love.graphics.setScissor()
+  -- The active scissor here is the ANCESTOR's clip (this element's own
+  -- content scissor was already restored by _drawChildren before overlay
+  -- behaviors run). Keep it: the scrollbar track lives inside this element's
+  -- border box, so the ancestor clip only cuts the parts of the track that
+  -- are scrolled out of view anyway. Clearing it let a partially-visible
+  -- nested list paint its scrollbar over content above (e.g. a fixed header).
   element._renderer:drawScrollbars(element, element.x, element.y, element.width, element.height, scrollbarDims)
 end
 

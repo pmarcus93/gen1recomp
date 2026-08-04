@@ -865,14 +865,28 @@ local function buildSlotCard(imp, parent, m, version)
     math.ceil(textHeight(pillSize)) + 8)
   local metaH = math.ceil(textHeight(metaSize))
   local rowH = 10 + headH + 5 + metaH + 8 + btnH + 10
-  -- Fixed-height scroller so 40 slots actually overflow (page-level flex
-  -- scroll alone was growing with content, leaving nothing to drag).
+  -- Desktop gets a fixed-height scroller (page-level flex scroll alone was
+  -- growing with content, leaving nothing to drag).  The height refits to
+  -- the space left under the card every frame (see fitSlotList in draw()).
+  -- On phone shapes the rows go straight into the page flow instead: the
+  -- page itself scrolls, so an inner scroller (and its scrollbar) would
+  -- only trap the finger.
   local listParent = c
-  if n > 0 then
-    local listH = math.floor(clamp(m.h * (m.twoCol and 0.58 or 0.42), 200, 720))
+  if m.twoCol and n > 0 then
+    -- A slim overlay scrollbar, but only once the rows actually overflow:
+    -- overlay placement floats the track over the right padding, so showing
+    -- it never reflows the rows the way reserve-space would.
+    local listH = imp._slotListHFit
+      or math.floor(clamp(m.h * 0.58, 200, 720))
+    local contentH = n * rowH + (n - 1) * 10 * m.s
     listParent = mk({
       parent = c, id = "slots-" .. version, width = "100%", height = listH,
-      overflowY = "scroll", hideScrollbars = true,
+      overflowY = "scroll",
+      hideScrollbars = contentH <= listH,
+      scrollbarPlacement = "overlay",
+      scrollbarWidth = 6, scrollbarRadius = 3, scrollbarPadding = 1,
+      scrollbarColor = C("border", 0.85),
+      scrollbarTrackColor = C("white", 0.06),
       positioning = "flex", flexDirection = "vertical", gap = 10 * m.s,
       padding = { right = 4 },
     })
@@ -1569,9 +1583,7 @@ local TRUST_WARNING = "if you did not get this from bryanthaboi's github "
   .. "it might have been tampered with. go to the discord to verify "
   .. COMMUNITY_URL .. " (or click the logo above)"
 
-local function buildFooter(imp, parent, m)
-  mk({ parent = parent, width = "100%", height = 1,
-    backgroundColor = C("border", 0.18) })
+local function drawBcgMark(imp, parent, heightPx, widthPx)
   -- The BCG mark is dark ink; invert it to white for the dark panel.
   imp.invertShader = imp.invertShader or love.graphics.newShader([[
     vec4 effect(vec4 color, Image tex, vec2 tc, vec2 sc) {
@@ -1580,10 +1592,9 @@ local function buildFooter(imp, parent, m)
     }
   ]])
   local bw, bh = imp.bcg:getDimensions()
-  local scale = math.min((180 * m.s) / bw, (44 * m.s) / bh)
+  local scale = math.min(widthPx / bw, heightPx / bh)
   mk({
     parent = parent, width = bw * scale, height = bh * scale,
-    alignSelf = "center",
     customDraw = function(el)
       love.graphics.setShader(imp.invertShader)
       love.graphics.setColor(1, 1, 1, imp._hot.bcg and 1 or 0.85)
@@ -1595,6 +1606,19 @@ local function buildFooter(imp, parent, m)
       love.system.openURL(COMMUNITY_URL)
     end),
   })
+end
+
+-- Desktop pins the footer under the scroll viewport (same content as the
+-- in-flow footer, just fixed); phone shapes keep it inside the page scroll
+-- because vertical space is too scarce there for a permanent bar.
+
+local function buildFooter(imp, parent, m)
+  mk({ parent = parent, width = "100%", height = 1,
+    backgroundColor = C("border", 0.18) })
+  local mark = mk({ parent = parent, width = "100%",
+    positioning = "flex", justifyContent = "center",
+    margin = { top = 6 } })
+  drawBcgMark(imp, mark, 44 * m.s, 180 * m.s)
   label(parent, TRUST_WARNING, 10 * m.s + 2, C("warn"),
     { width = "100%", textAlign = "center" })
   -- the link gets a full-width, center-aligned row of its own: alignSelf on
@@ -1996,11 +2020,28 @@ function LauncherView.draw(imp)
     twoCol = appW >= 640,
   }
   m.colGap = 16 * m.s
-  -- scrollbars are hidden (wheel and touch drag still scroll); the slim
-  -- gutter is breathing room so content never touches the window edge
-  m.gutter = 8
-  m.contentW = appW - 2 * m.pad - m.gutter
+  m.contentW = appW - 2 * m.pad
   m.colW = m.twoCol and math.floor((m.contentW - m.colGap) / 2) or m.contentW
+
+  -- Dev harness: POKEPORT_LAUNCHER_SCROLL=N scrolls the page viewport N px,
+  -- or "some-id:N" scrolls any element by id (e.g. slots-red:200 for the
+  -- nested save-slot list), so the screenshot harness can capture below the
+  -- fold.  Written into the persisted state BEFORE the tree builds: elements
+  -- are recreated every frame, so a direct setScrollPosition would race this
+  -- frame's layout.
+  local scrollSpec = os.getenv("POKEPORT_LAUNCHER_SCROLL")
+  if scrollSpec then
+    local targetId, px = scrollSpec:match("^([%w%-_]+):(%d+)$")
+    if not px then
+      targetId, px = "page-" .. imp.tab, scrollSpec:match("^(%d+)$")
+    end
+    if px then
+      local StateManager = require("libs.flexlove.modules.StateManager")
+      local st = StateManager.getState(targetId, {})
+      st.scrollManager = st.scrollManager or {}
+      st.scrollManager._scrollY = tonumber(px)
+    end
+  end
 
   local root = mk({
     x = m.x, y = m.top, width = m.w, height = m.h,
@@ -2017,7 +2058,7 @@ function LauncherView.draw(imp)
     overflowY = "scroll", hideScrollbars = true,
     positioning = "flex", flexDirection = "vertical",
     gap = 12 * m.s,
-    padding = { left = m.pad, right = m.pad + m.gutter,
+    padding = { left = m.pad, right = m.pad,
       top = 14 * m.s, bottom = 10 * m.s },
   })
   if imp.tab == "mods" then
@@ -2028,12 +2069,40 @@ function LauncherView.draw(imp)
     buildGamePanel(imp, page, m, imp.tab)
   end
   buildBanner(imp, page, m)
-  buildFooter(imp, page, m)
+  if m.twoCol then
+    -- Desktop: the footer pins under the scroll viewport; the page's flex=1
+    -- keeps content strictly between header and footer.
+    buildFooter(imp, root, m)
+  else
+    buildFooter(imp, page, m)
+  end
 
   buildModals(imp, m)
 
   FlexLove.draw()
   drawPadCursor(imp)
+
+  -- Refit the desktop slot-list height to the space actually left under its
+  -- card: measure this frame's laid-out geometry and nudge next frame's
+  -- height by the gap between the card's bottom edge and the page
+  -- viewport's.  Converges in a frame or two (the relationship is linear)
+  -- and self-corrects after every resize.
+  if m.twoCol and imp.panelVersion then
+    local v = imp.panelVersion
+    local pageEl = FlexLove.getById("page-" .. imp.tab)
+    local listEl = FlexLove.getById("slots-" .. v)
+    local btnEl = FlexLove.getById(
+      "btn:slot-new-" .. v .. ":" .. tostring(Strings("+ New save slot")))
+    if pageEl and listEl and btnEl then
+      local pageBottom = pageEl.y + pageEl:getBorderBoxHeight() - 10 * m.s
+      local btnBottom = btnEl.y + btnEl:getBorderBoxHeight()
+      -- 15 = the slot card's vertical padding (14) + border (1)
+      local delta = pageBottom - 15 - btnBottom
+      if math.abs(delta) > 1 then
+        imp._slotListHFit = clamp(listEl.height + delta, 160, m.h)
+      end
+    end
+  end
 
   -- Dev harness: POKEPORT_LAUNCHER_DUMP=1 prints the laid-out tree once
   -- (id/text, x, y, w, h) so geometry bugs are read off numbers instead of
